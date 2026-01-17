@@ -1,0 +1,41 @@
+{
+  "name": "claude-bug",
+  "version": "0.1.0",
+  "description": "Capture visual bugs and terminal context to share with AI coding assistants",
+  "main": "dist/cli.js",
+  "bin": {
+    "claude-bug": "./dist/cli.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "start": "node dist/cli.js",
+    "lint": "eslint src/**/*.ts",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "debugging",
+    "screen-recording",
+    "cli",
+    "developer-tools",
+    "ai",
+    "claude"
+  ],
+  "author": "",
+  "license": "MIT",
+  "type": "commonjs",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "chalk": "^4.1.2",
+    "commander": "^11.1.0",
+    "ora": "^5.4.1",
+    "uuid": "^9.0.1"
+  },
+  "devDependencies": {
+    "@types/node": "^20.10.0",
+    "@types/uuid": "^9.0.7",
+    "typescript": "^5.3.2"
+  }
+}
