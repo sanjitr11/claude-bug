@@ -3,22 +3,18 @@
 import { Command } from 'commander';
 import chalk from 'chalk';
 import ora from 'ora';
-import { v4 as uuidv4 } from 'uuid';
-import * as fs from 'fs';
 import { execSync } from 'child_process';
 import * as readline from 'readline';
 
 import {
   checkFfmpegInstalled,
-  getFfmpegInstallInstructions,
-  captureFrames,
-  startInteractiveCapture
+  getFfmpegInstallInstructions
 } from './recorder';
+import { runCapture, startCapture, getCaptureReport } from './capture';
+import { formatReport, formatFileSize, formatCaptureSummary } from './formatter';
+import { formatTokenEstimate, getTokenBreakdown } from './tokens';
 import {
   ensureStorageExists,
-  getCaptureDir,
-  getFormattedPath,
-  saveCapture,
   listCaptures,
   getCapture,
   deleteCapture,
@@ -31,8 +27,6 @@ import {
   markCaptureViewed,
   parseDuration
 } from './storage';
-import { formatForClaude, saveFormattedOutput, formatFileSize, formatDuration } from './formatter';
-import { BugCapture } from './types';
 
 const program = new Command();
 
@@ -77,10 +71,20 @@ function waitForKeypress(): Promise<void> {
   });
 }
 
+// Copy text to clipboard
+function copyToClipboard(text: string): boolean {
+  try {
+    execSync('pbcopy', { input: text, encoding: 'utf-8' });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 program
   .name('claude-bug')
-  .description('Capture visual bugs to share with Claude Code')
-  .version('0.2.0')
+  .description('Capture visual bugs as token-optimized context for Claude Code')
+  .version('1.0.0')
   .hook('preAction', () => {
     silentCleanup();
   });
@@ -88,13 +92,12 @@ program
 // Capture command
 program
   .command('capture')
-  .description('Capture screenshots of a bug')
-  .argument('<description>', 'Description of the bug')
-  .option('-i, --interactive', 'Interactive mode: capture until you press any key to stop')
-  .option('-t, --temp', 'Temporary capture (auto-deletes after first view)')
+  .description('Capture a visual bug')
+  .argument('<description>', 'Bug description')
+  .option('-i, --interactive', 'Interactive mode - stop recording on keypress')
+  .option('-t, --temp', 'Temporary capture - auto-delete after first view')
   .action(async (description: string, options: { interactive: boolean; temp: boolean }) => {
     const config = loadConfig();
-    const duration = config.duration;
 
     // Check ffmpeg
     if (!checkFfmpegInstalled()) {
@@ -105,88 +108,102 @@ program
 
     ensureStorageExists();
 
-    const id = uuidv4();
-    const captureDir = getCaptureDir(id);
-    const formattedPath = getFormattedPath(id);
-
     console.log(chalk.cyan('\nclaude-bug capture\n'));
-    console.log(chalk.dim(`ID: ${id.substring(0, 8)}`));
     console.log(chalk.dim(`Description: ${description}`));
+    console.log(chalk.dim(`Duration: ${config.duration}s | Target frames: ${config.targetKeyFrames}`));
     if (options.temp) {
       console.log(chalk.yellow('Mode: Temporary (will delete after first view)'));
     }
     console.log('');
 
-    let result;
+    const spinner = ora();
 
-    if (options.interactive) {
-      // Interactive mode: capture until keypress
-      console.log(chalk.cyan('Starting capture...'));
-      console.log(chalk.dim('Press any key to stop.\n'));
-
-      const handle = startInteractiveCapture({
-        duration: 0,
-        outputDir: captureDir
-      });
-
-      const captureSpinner = ora('Capturing... (press any key to stop)').start();
-
-      await waitForKeypress();
-
-      captureSpinner.text = 'Stopping capture...';
-      result = await handle.stop();
-
-      if (result.success) {
-        captureSpinner.succeed(`Captured ${result.frames.length} frames over ${result.duration}s`);
-      } else {
-        captureSpinner.fail(`Capture failed: ${result.error}`);
-        process.exit(1);
-      }
-    } else {
-      // Fixed duration mode
-      const captureSpinner = ora(`Capturing ${duration} frames over ${duration}s...`).start();
-
-      result = await captureFrames({
-        duration,
-        outputDir: captureDir
-      });
-
-      if (result.success) {
-        captureSpinner.succeed(`Captured ${result.frames.length} frames`);
-      } else {
-        captureSpinner.fail(`Capture failed: ${result.error}`);
-        process.exit(1);
-      }
-    }
-
-    // Create bug capture object
-    const capture: BugCapture = {
-      id,
-      description,
-      timestamp: new Date(),
-      frames: result.frames,
-      duration: result.duration
-    };
-
-    // Save capture
-    const saveSpinner = ora('Saving capture...').start();
-    saveCapture(capture, options.temp);
-    saveFormattedOutput(capture, formattedPath);
-    saveSpinner.succeed('Capture saved');
-
-    if (options.temp) {
-      console.log(chalk.yellow('\nThis is a temporary capture - it will be deleted after you view it once.'));
-    }
-
-    // Copy report to clipboard
-    const report = formatForClaude(capture);
     try {
-      execSync('pbcopy', { input: report, encoding: 'utf-8' });
-      console.log(chalk.green('\n✓ Report copied to clipboard - paste into Claude Code\n'));
-    } catch {
-      console.log(chalk.yellow('\nCould not copy to clipboard. View with:'));
-      console.log(`  ${chalk.cyan(`claude-bug view ${id.substring(0, 8)}`)}\n`);
+      if (options.interactive) {
+        // Interactive mode
+        console.log(chalk.cyan('Starting recording...'));
+        console.log(chalk.dim('Press any key to stop.\n'));
+
+        const handle = startCapture(description, config, (stage, progress, message) => {
+          if (stage === 'recording') {
+            spinner.text = 'Recording... (press any key to stop)';
+          } else {
+            spinner.text = message || stage;
+          }
+        });
+
+        spinner.start('Recording... (press any key to stop)');
+
+        await waitForKeypress();
+
+        spinner.text = 'Processing...';
+        const capture = await handle.stop();
+
+        spinner.succeed('Capture complete');
+
+        // Show summary
+        console.log(chalk.green('\nCapture complete!'));
+        console.log(formatCaptureSummary(capture));
+
+        // Copy to clipboard
+        const report = getCaptureReport(capture);
+        if (copyToClipboard(report)) {
+          console.log(chalk.green('\nReport copied to clipboard - paste into Claude Code'));
+        } else {
+          console.log(chalk.yellow(`\nView with: claude-bug view ${capture.id.substring(0, 8)}`));
+        }
+
+      } else {
+        // Fixed duration mode
+        spinner.start(`Recording ${config.duration}s...`);
+
+        const capture = await runCapture(description, config, (stage, progress, message) => {
+          switch (stage) {
+            case 'recording':
+              spinner.text = `Recording... ${Math.round(progress)}%`;
+              break;
+            case 'extracting':
+              spinner.text = message || 'Extracting frames...';
+              break;
+            case 'selecting':
+              spinner.text = message || 'Selecting key frames...';
+              break;
+            case 'optimizing':
+              spinner.text = message || 'Optimizing images...';
+              break;
+            case 'context':
+              spinner.text = 'Gathering context...';
+              break;
+            case 'formatting':
+              spinner.text = 'Generating report...';
+              break;
+            case 'saving':
+              spinner.text = 'Saving...';
+              break;
+          }
+        });
+
+        spinner.succeed('Capture complete');
+
+        // Show summary
+        console.log(chalk.green('\nCapture complete!'));
+        console.log(formatCaptureSummary(capture));
+
+        // Copy to clipboard
+        const report = getCaptureReport(capture);
+        if (copyToClipboard(report)) {
+          console.log(chalk.green('\nReport copied to clipboard - paste into Claude Code'));
+        } else {
+          console.log(chalk.yellow(`\nView with: claude-bug view ${capture.id.substring(0, 8)}`));
+        }
+      }
+
+    } catch (error) {
+      spinner.fail(`Capture failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
+      process.exit(1);
     }
+
+    console.log('');
   });
 
 // List command
@@ -223,7 +240,7 @@ program
         chalk.dim('         ') +
         date.toLocaleDateString() + ' ' + date.toLocaleTimeString() +
         chalk.dim(' | ') +
-        chalk.green(`${capture.frames.length} frames, ${capture.duration}s`)
+        chalk.green(`${capture.keyFrameCount} frames, ${formatTokenEstimate(capture.tokenEstimate)} tokens`)
       );
       console.log('');
     }
@@ -238,7 +255,7 @@ program
 // View command
 program
   .command('view')
-  .description('View a capture and copy to clipboard')
+  .description('View a capture and copy report to clipboard')
   .argument('<id>', 'Capture ID (first 8 characters are enough)')
   .option('--json', 'Output raw JSON')
   .action((id: string, options: { json: boolean }) => {
@@ -263,16 +280,29 @@ program
       return;
     }
 
-    // Copy to clipboard and display
-    const report = formatForClaude(capture);
-    try {
-      execSync('pbcopy', { input: report, encoding: 'utf-8' });
-      console.log(chalk.green('\n✓ Report copied to clipboard\n'));
-    } catch {
-      // Continue even if clipboard fails
+    // Copy to clipboard and display summary
+    const report = formatReport(capture);
+    if (copyToClipboard(report)) {
+      console.log(chalk.green('\nReport copied to clipboard\n'));
     }
 
-    console.log(report);
+    // Show summary
+    const breakdown = getTokenBreakdown(capture);
+    console.log(chalk.cyan(`Bug: ${capture.description}`));
+    console.log(chalk.dim(`ID: ${capture.id.substring(0, 8)}`));
+    console.log(chalk.dim(`Captured: ${capture.timestamp.toLocaleString()}`));
+    console.log(chalk.dim(`Duration: ${capture.duration}s`));
+    console.log('');
+    console.log(chalk.bold('Key Frames:'));
+    for (const frame of capture.keyFrames) {
+      console.log(`  ${frame.timestamp.toFixed(1)}s - ${frame.reason}`);
+    }
+    console.log('');
+    console.log(chalk.bold('Token Estimate:'));
+    console.log(`  Images: ${formatTokenEstimate(breakdown.images)}`);
+    console.log(`  Context: ${formatTokenEstimate(breakdown.terminal + breakdown.git)}`);
+    console.log(`  Total: ${formatTokenEstimate(breakdown.total)}`);
+    console.log('');
   });
 
 // Delete command
@@ -300,7 +330,7 @@ program
     const success = deleteCapture(id);
 
     if (success) {
-      console.log(chalk.green(`\n✓ Deleted capture: ${id.substring(0, 8)}\n`));
+      console.log(chalk.green(`\nDeleted capture: ${id.substring(0, 8)}\n`));
     } else {
       console.error(chalk.red('\nFailed to delete capture\n'));
       process.exit(1);
@@ -334,7 +364,7 @@ program
       }
 
       const result = deleteAllCaptures();
-      console.log(chalk.green(`\n✓ Deleted ${result.deleted} captures\n`));
+      console.log(chalk.green(`\nDeleted ${result.deleted} captures\n`));
       return;
     }
 
@@ -367,7 +397,7 @@ program
       }
 
       const result = deleteCapturesOlderThan(options.olderThan);
-      console.log(chalk.green(`\n✓ Deleted ${result.deleted} captures\n`));
+      console.log(chalk.green(`\nDeleted ${result.deleted} captures\n`));
       return;
     }
 
@@ -378,69 +408,124 @@ program
 program
   .command('config')
   .description('View or set configuration')
-  .argument('[key]', 'Config key (duration, ttl)')
+  .argument('[key]', 'Config key (duration, targetFrames, diffThreshold, maxTokens, ttl)')
   .argument('[value]', 'Value to set')
   .action((key?: string, value?: string) => {
     const config = loadConfig();
 
     if (!key) {
       console.log(chalk.cyan('\nConfiguration\n'));
-      console.log(`  duration: ${config.duration} seconds`);
-      console.log(`  ttl: ${config.ttlDays === 0 ? 'disabled' : `${config.ttlDays} days`}`);
+      console.log(`  duration: ${config.duration} seconds (recording length)`);
+      console.log(`  targetFrames: ${config.targetKeyFrames} frames (target key frames)`);
+      console.log(`  diffThreshold: ${config.diffThreshold}% (min visual difference)`);
+      console.log(`  maxTokens: ${config.maxTokens} tokens (token budget)`);
+      console.log(`  ttl: ${config.ttlDays === 0 ? 'disabled' : `${config.ttlDays} days`} (auto-delete)`);
       console.log(chalk.dim('\nSet with: claude-bug config <key> <value>'));
-      console.log(chalk.dim('Example: claude-bug config duration 10\n'));
+      console.log(chalk.dim('Example: claude-bug config duration 30\n'));
       return;
     }
 
     if (!value) {
-      if (key === 'duration') {
-        console.log(`duration: ${config.duration} seconds`);
-      } else if (key === 'ttl') {
-        console.log(`ttl: ${config.ttlDays} days`);
-      } else {
-        console.error(chalk.red(`Unknown config key: ${key}`));
-        process.exit(1);
+      switch (key) {
+        case 'duration':
+          console.log(`duration: ${config.duration} seconds`);
+          break;
+        case 'targetFrames':
+          console.log(`targetFrames: ${config.targetKeyFrames} frames`);
+          break;
+        case 'diffThreshold':
+          console.log(`diffThreshold: ${config.diffThreshold}%`);
+          break;
+        case 'maxTokens':
+          console.log(`maxTokens: ${config.maxTokens} tokens`);
+          break;
+        case 'ttl':
+          console.log(`ttl: ${config.ttlDays} days`);
+          break;
+        default:
+          console.error(chalk.red(`Unknown config key: ${key}`));
+          process.exit(1);
       }
       return;
     }
 
-    if (key === 'duration') {
-      const seconds = parseInt(value, 10);
-      if (isNaN(seconds) || seconds < 1 || seconds > 60) {
-        console.error(chalk.red('Duration must be between 1 and 60 seconds'));
+    const numValue = parseInt(value, 10);
+
+    switch (key) {
+      case 'duration':
+        if (isNaN(numValue) || numValue < 5 || numValue > 120) {
+          console.error(chalk.red('Duration must be between 5 and 120 seconds'));
+          process.exit(1);
+        }
+        setConfigValue('duration', numValue);
+        console.log(chalk.green(`\nDuration set to ${numValue} seconds\n`));
+        break;
+
+      case 'targetFrames':
+        if (isNaN(numValue) || numValue < 3 || numValue > 15) {
+          console.error(chalk.red('Target frames must be between 3 and 15'));
+          process.exit(1);
+        }
+        setConfigValue('targetKeyFrames', numValue);
+        console.log(chalk.green(`\nTarget frames set to ${numValue}\n`));
+        break;
+
+      case 'diffThreshold':
+        if (isNaN(numValue) || numValue < 1 || numValue > 20) {
+          console.error(chalk.red('Diff threshold must be between 1 and 20 percent'));
+          process.exit(1);
+        }
+        setConfigValue('diffThreshold', numValue);
+        console.log(chalk.green(`\nDiff threshold set to ${numValue}%\n`));
+        break;
+
+      case 'maxTokens':
+        if (isNaN(numValue) || numValue < 5000 || numValue > 50000) {
+          console.error(chalk.red('Max tokens must be between 5000 and 50000'));
+          process.exit(1);
+        }
+        setConfigValue('maxTokens', numValue);
+        console.log(chalk.green(`\nMax tokens set to ${numValue}\n`));
+        break;
+
+      case 'ttl':
+        if (isNaN(numValue) || numValue < 0) {
+          console.error(chalk.red('TTL must be a non-negative number (0 = never delete)'));
+          process.exit(1);
+        }
+        setConfigValue('ttlDays', numValue);
+        console.log(chalk.green(`\nTTL set to ${numValue === 0 ? 'disabled' : `${numValue} days`}\n`));
+        break;
+
+      default:
+        console.error(chalk.red(`Unknown config key: ${key}`));
+        console.log(chalk.dim('Valid keys: duration, targetFrames, diffThreshold, maxTokens, ttl'));
         process.exit(1);
-      }
-      setConfigValue('duration', seconds);
-      console.log(chalk.green(`\n✓ Duration set to ${seconds} seconds\n`));
-    } else if (key === 'ttl') {
-      const days = parseInt(value, 10);
-      if (isNaN(days) || days < 0) {
-        console.error(chalk.red('TTL must be a non-negative number (0 = never delete)'));
-        process.exit(1);
-      }
-      setConfigValue('ttlDays', days);
-      console.log(chalk.green(`\n✓ TTL set to ${days === 0 ? 'disabled' : `${days} days`}\n`));
-    } else {
-      console.error(chalk.red(`Unknown config key: ${key}`));
-      process.exit(1);
     }
   });
 
 // Status command
 program
   .command('status')
-  .description('Show storage status')
+  .description('Show status and storage stats')
   .action(() => {
     console.log(chalk.cyan('\nclaude-bug status\n'));
 
     const hasFfmpeg = checkFfmpegInstalled();
     console.log(
       chalk.bold('ffmpeg: ') +
-      (hasFfmpeg ? chalk.green('✓ installed') : chalk.red('✗ not found'))
+      (hasFfmpeg ? chalk.green('installed') : chalk.red('not found'))
     );
 
     const stats = getStorageStats();
     const config = loadConfig();
+
+    console.log(chalk.bold('\nConfiguration:'));
+    console.log(`  Recording duration: ${config.duration}s`);
+    console.log(`  Target key frames: ${config.targetKeyFrames}`);
+    console.log(`  Diff threshold: ${config.diffThreshold}%`);
+    console.log(`  Token budget: ${config.maxTokens}`);
+
     console.log(chalk.bold('\nStorage:'));
     console.log(`  Captures: ${stats.totalCaptures}`);
     console.log(`  Size: ${formatFileSize(stats.totalSize)}`);

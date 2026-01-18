@@ -1,11 +1,10 @@
 import { execSync, spawn, ChildProcess } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
-import { CaptureOptions, CaptureResult, InteractiveCaptureHandle } from './types';
+import { RecordingOptions, RecordingResult, InteractiveRecordingHandle } from './types';
 
 // Get the path to the overlay binary
 function getOverlayPath(): string {
-  // Check multiple locations
   const locations = [
     path.join(__dirname, '..', 'dist', 'recording-overlay'),
     path.join(__dirname, 'recording-overlay'),
@@ -79,8 +78,6 @@ Or download from: https://ffmpeg.org/download.html`;
  * Check screen recording permission on macOS
  */
 export function checkScreenRecordingPermission(): { granted: boolean; message: string } {
-  // On macOS, we can't programmatically check screen recording permission
-  // The best we can do is try to capture and see if it fails
   return {
     granted: true,
     message: 'Screen recording permission status unknown. If capture fails, grant permission in System Preferences > Privacy & Security > Screen Recording.'
@@ -88,170 +85,239 @@ export function checkScreenRecordingPermission(): { granted: boolean; message: s
 }
 
 /**
- * Get available display devices
+ * Get screen capture device ID (macOS AVFoundation)
+ * Parses ffmpeg device list to find screen capture device
  */
-export function getAvailableDisplays(): string[] {
+export function getScreenDeviceId(): string {
   try {
     const output = execSync('ffmpeg -f avfoundation -list_devices true -i "" 2>&1 || true', {
       encoding: 'utf-8'
     });
 
-    const displays: string[] = [];
     const lines = output.split('\n');
-
     for (const line of lines) {
       const match = line.match(/\[(\d+)\] Capture screen/);
       if (match) {
-        displays.push(match[1]);
+        return match[1];
       }
     }
 
-    return displays.length > 0 ? displays : ['3']; // Default to 3 if none found
+    return '3'; // Default fallback
   } catch {
-    return ['3'];
+    return '3';
   }
 }
 
 /**
- * Capture a single screenshot using ffmpeg
+ * Record screen video using ffmpeg
+ *
+ * Settings:
+ * - 30fps recording
+ * - 1280x720 resolution (720p)
+ * - H.264 codec with fast preset
+ * - Includes cursor and click indicators
  */
-function captureFrame(displayId: string, outputPath: string): boolean {
-  try {
-    execSync(
-      `ffmpeg -f avfoundation -capture_cursor 1 -i "${displayId}:none" -frames:v 1 -y "${outputPath}" 2>/dev/null`,
-      { timeout: 5000 }
-    );
-    return fs.existsSync(outputPath);
-  } catch {
-    return false;
-  }
-}
-
-/**
- * Sleep for specified milliseconds
- */
-function sleep(ms: number): Promise<void> {
-  return new Promise(resolve => setTimeout(resolve, ms));
-}
-
-/**
- * Capture frames at regular intervals for a fixed duration
- */
-export async function captureFrames(options: CaptureOptions): Promise<CaptureResult> {
-  const { duration, outputDir, displayId = '3', frameInterval = 1 } = options;
+export async function recordScreen(options: RecordingOptions): Promise<RecordingResult> {
+  const {
+    duration,
+    resolution = { width: 1280, height: 720 },
+    fps = 30,
+    outputPath
+  } = options;
 
   // Ensure output directory exists
+  const outputDir = path.dirname(outputPath);
   if (!fs.existsSync(outputDir)) {
     fs.mkdirSync(outputDir, { recursive: true });
   }
 
-  // Start the recording overlay
-  const overlay = startOverlay();
-
-  const frames: string[] = [];
-  const numFrames = Math.ceil(duration / frameInterval);
-  const startTime = Date.now();
-
-  for (let i = 0; i < numFrames; i++) {
-    const frameNum = String(i + 1).padStart(3, '0');
-    const framePath = path.join(outputDir, `frame_${frameNum}.png`);
-
-    const success = captureFrame(displayId, framePath);
-    if (success) {
-      frames.push(framePath);
-    }
-
-    // Wait for next frame (unless this is the last one)
-    if (i < numFrames - 1) {
-      await sleep(frameInterval * 1000);
-    }
-  }
-
-  // Stop the overlay
-  stopOverlay(overlay);
-
-  const actualDuration = Math.round((Date.now() - startTime) / 1000);
-
-  if (frames.length === 0) {
-    return {
-      success: false,
-      frames: [],
-      duration: 0,
-      error: 'Failed to capture any frames. Check screen recording permissions.'
-    };
-  }
-
-  return {
-    success: true,
-    frames,
-    duration: actualDuration
-  };
-}
-
-/**
- * Start interactive frame capture (captures until stopped)
- */
-export function startInteractiveCapture(options: CaptureOptions): InteractiveCaptureHandle {
-  const { outputDir, displayId = '3', frameInterval = 1 } = options;
-
-  // Ensure output directory exists
-  if (!fs.existsSync(outputDir)) {
-    fs.mkdirSync(outputDir, { recursive: true });
-  }
+  const displayId = getScreenDeviceId();
 
   // Start the recording overlay
   const overlay = startOverlay();
 
-  const frames: string[] = [];
-  let stopped = false;
-  let frameCount = 0;
-  const startTime = Date.now();
+  return new Promise((resolve) => {
+    const startTime = Date.now();
 
-  // Start capturing frames in background
-  const captureLoop = async () => {
-    while (!stopped) {
-      frameCount++;
-      const frameNum = String(frameCount).padStart(3, '0');
-      const framePath = path.join(outputDir, `frame_${frameNum}.png`);
+    // Build ffmpeg command
+    // Using scale with padding to ensure consistent resolution
+    const scaleFilter = `scale=${resolution.width}:${resolution.height}:force_original_aspect_ratio=decrease,pad=${resolution.width}:${resolution.height}:(ow-iw)/2:(oh-ih)/2`;
 
-      const success = captureFrame(displayId, framePath);
-      if (success) {
-        frames.push(framePath);
+    const args = [
+      '-f', 'avfoundation',
+      '-capture_cursor', '1',
+      '-capture_mouse_clicks', '1',
+      '-i', `${displayId}:none`,
+      '-t', String(duration),
+      '-r', String(fps),
+      '-c:v', 'libx264',
+      '-preset', 'fast',
+      '-crf', '23',
+      '-vf', scaleFilter,
+      '-pix_fmt', 'yuv420p',
+      '-y',
+      outputPath
+    ];
+
+    const ffmpeg = spawn('ffmpeg', args, {
+      stdio: ['ignore', 'pipe', 'pipe']
+    });
+
+    let stderr = '';
+    ffmpeg.stderr?.on('data', (data) => {
+      stderr += data.toString();
+    });
+
+    ffmpeg.on('close', (code) => {
+      // Stop the overlay
+      stopOverlay(overlay);
+
+      const actualDuration = Math.round((Date.now() - startTime) / 1000);
+
+      if (code === 0 && fs.existsSync(outputPath)) {
+        resolve({
+          success: true,
+          videoPath: outputPath,
+          duration: actualDuration
+        });
+      } else {
+        resolve({
+          success: false,
+          videoPath: outputPath,
+          duration: 0,
+          error: `Recording failed (exit code ${code}): ${stderr.slice(-500)}`
+        });
       }
+    });
 
-      if (!stopped) {
-        await sleep(frameInterval * 1000);
-      }
-    }
-  };
-
-  // Start the capture loop
-  const loopPromise = captureLoop();
-
-  const stop = async (): Promise<CaptureResult> => {
-    stopped = true;
-    await loopPromise;
-
-    // Stop the overlay
-    stopOverlay(overlay);
-
-    const actualDuration = Math.round((Date.now() - startTime) / 1000);
-
-    if (frames.length === 0) {
-      return {
+    ffmpeg.on('error', (err) => {
+      stopOverlay(overlay);
+      resolve({
         success: false,
-        frames: [],
+        videoPath: outputPath,
         duration: 0,
-        error: 'Failed to capture any frames. Check screen recording permissions.'
-      };
-    }
+        error: `Failed to start ffmpeg: ${err.message}`
+      });
+    });
+  });
+}
 
-    return {
-      success: true,
-      frames,
-      duration: actualDuration
-    };
+/**
+ * Start interactive recording (records until stopped)
+ * Returns handle with stop() method
+ */
+export function startInteractiveRecording(
+  options: Omit<RecordingOptions, 'duration'>
+): InteractiveRecordingHandle {
+  const {
+    resolution = { width: 1280, height: 720 },
+    fps = 30,
+    outputPath
+  } = options;
+
+  // Ensure output directory exists
+  const outputDir = path.dirname(outputPath);
+  if (!fs.existsSync(outputDir)) {
+    fs.mkdirSync(outputDir, { recursive: true });
+  }
+
+  const displayId = getScreenDeviceId();
+
+  // Start the recording overlay
+  const overlay = startOverlay();
+
+  const startTime = Date.now();
+
+  // Build ffmpeg command (no duration limit)
+  const scaleFilter = `scale=${resolution.width}:${resolution.height}:force_original_aspect_ratio=decrease,pad=${resolution.width}:${resolution.height}:(ow-iw)/2:(oh-ih)/2`;
+
+  const args = [
+    '-f', 'avfoundation',
+    '-capture_cursor', '1',
+    '-capture_mouse_clicks', '1',
+    '-i', `${displayId}:none`,
+    '-r', String(fps),
+    '-c:v', 'libx264',
+    '-preset', 'fast',
+    '-crf', '23',
+    '-vf', scaleFilter,
+    '-pix_fmt', 'yuv420p',
+    '-y',
+    outputPath
+  ];
+
+  const ffmpeg = spawn('ffmpeg', args, {
+    stdio: ['pipe', 'pipe', 'pipe']
+  });
+
+  let stderr = '';
+  ffmpeg.stderr?.on('data', (data) => {
+    stderr += data.toString();
+  });
+
+  let resolved = false;
+
+  const stop = (): Promise<RecordingResult> => {
+    return new Promise((resolve) => {
+      if (resolved) {
+        resolve({
+          success: false,
+          videoPath: outputPath,
+          duration: 0,
+          error: 'Recording already stopped'
+        });
+        return;
+      }
+
+      ffmpeg.on('close', (code) => {
+        resolved = true;
+        stopOverlay(overlay);
+
+        const actualDuration = Math.round((Date.now() - startTime) / 1000);
+
+        if ((code === 0 || code === 255) && fs.existsSync(outputPath)) {
+          resolve({
+            success: true,
+            videoPath: outputPath,
+            duration: actualDuration
+          });
+        } else {
+          resolve({
+            success: false,
+            videoPath: outputPath,
+            duration: 0,
+            error: `Recording failed (exit code ${code}): ${stderr.slice(-500)}`
+          });
+        }
+      });
+
+      // Send 'q' to ffmpeg to gracefully stop recording
+      ffmpeg.stdin?.write('q');
+      ffmpeg.stdin?.end();
+
+      // Fallback: kill after 3 seconds if not stopped
+      setTimeout(() => {
+        if (!resolved) {
+          ffmpeg.kill('SIGTERM');
+        }
+      }, 3000);
+    });
   };
 
   return { stop };
+}
+
+/**
+ * Get video duration in seconds using ffprobe
+ */
+export async function getVideoDuration(videoPath: string): Promise<number> {
+  try {
+    const output = execSync(
+      `ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "${videoPath}"`,
+      { encoding: 'utf-8' }
+    );
+    return Math.round(parseFloat(output.trim()));
+  } catch {
+    return 0;
+  }
 }

@@ -1,7 +1,7 @@
 {
   "name": "claude-bug",
-  "version": "0.1.0",
-  "description": "Capture visual bugs and terminal context to share with AI coding assistants",
+  "version": "1.0.0",
+  "description": "Capture visual bugs as token-optimized context for Claude Code",
   "main": "dist/cli.js",
   "bin": {
     "claude-bug": "./dist/cli.js"
@@ -30,6 +30,7 @@
   "dependencies": {
     "chalk": "^4.1.2",
     "commander": "^11.1.0",
+    "jimp": "^0.22.12",
     "ora": "^5.4.1",
     "uuid": "^9.0.1"
   },

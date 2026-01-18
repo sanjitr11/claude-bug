@@ -9,8 +9,11 @@ const METADATA_FILE = path.join(CLAUDE_BUG_DIR, 'captures.json');
 const CONFIG_FILE = path.join(CLAUDE_BUG_DIR, 'config.json');
 
 const DEFAULT_CONFIG: Config = {
-  ttlDays: 7,
-  duration: 5
+  duration: 30,           // 30 second recording
+  targetKeyFrames: 6,     // 6 key frames
+  diffThreshold: 3,       // 3% difference threshold
+  maxTokens: 10000,       // 10k token budget
+  ttlDays: 7              // Auto-delete after 7 days
 };
 
 /**
@@ -29,7 +32,7 @@ export function ensureStorageExists(): void {
 }
 
 /**
- * Get the directory for a capture's frames
+ * Get the base directory for a capture
  */
 export function getCaptureDir(id: string): string {
   ensureStorageExists();
@@ -37,57 +40,38 @@ export function getCaptureDir(id: string): string {
 }
 
 /**
- * Get the path for a context JSON file
+ * Get path to video file
+ */
+export function getVideoPath(id: string): string {
+  return path.join(getCaptureDir(id), 'recording.mp4');
+}
+
+/**
+ * Get path to frames directory
+ */
+export function getFramesDir(id: string): string {
+  return path.join(getCaptureDir(id), 'frames');
+}
+
+/**
+ * Get path to key frames directory
+ */
+export function getKeyFramesDir(id: string): string {
+  return path.join(getCaptureDir(id), 'key_frames');
+}
+
+/**
+ * Get path to capture JSON file
  */
 export function getContextPath(id: string): string {
   return path.join(getCaptureDir(id), 'capture.json');
 }
 
 /**
- * Get the path for a formatted markdown file
+ * Get path to formatted report
  */
 export function getFormattedPath(id: string): string {
   return path.join(getCaptureDir(id), 'report.md');
-}
-
-/**
- * Save capture metadata
- */
-export function saveCapture(capture: BugCapture, isTemp: boolean = false): CaptureMetadata {
-  ensureStorageExists();
-
-  const captureDir = getCaptureDir(capture.id);
-  if (!fs.existsSync(captureDir)) {
-    fs.mkdirSync(captureDir, { recursive: true });
-  }
-
-  const metadata: CaptureMetadata = {
-    id: capture.id,
-    description: capture.description,
-    timestamp: capture.timestamp.toISOString(),
-    frames: capture.frames,
-    duration: capture.duration,
-    isTemp
-  };
-
-  // Save full context as JSON
-  fs.writeFileSync(
-    getContextPath(capture.id),
-    JSON.stringify(capture, null, 2)
-  );
-
-  // Update metadata index
-  const index = loadMetadataIndex();
-  index.captures.unshift(metadata); // Add to beginning (most recent first)
-
-  // Keep only last 100 captures in index
-  if (index.captures.length > 100) {
-    index.captures = index.captures.slice(0, 100);
-  }
-
-  saveMetadataIndex(index);
-
-  return metadata;
 }
 
 /**
@@ -112,6 +96,52 @@ function saveMetadataIndex(index: { captures: CaptureMetadata[] }): void {
 }
 
 /**
+ * Save capture metadata and full capture data
+ */
+export function saveCapture(capture: BugCapture, isTemp: boolean = false): CaptureMetadata {
+  ensureStorageExists();
+
+  const captureDir = getCaptureDir(capture.id);
+  if (!fs.existsSync(captureDir)) {
+    fs.mkdirSync(captureDir, { recursive: true });
+  }
+
+  // Create metadata
+  const metadata: CaptureMetadata = {
+    id: capture.id,
+    description: capture.description,
+    timestamp: capture.timestamp.toISOString(),
+    duration: capture.duration,
+    keyFrameCount: capture.keyFrames.length,
+    tokenEstimate: capture.metrics.tokenEstimate,
+    isTemp
+  };
+
+  // Save full capture data as JSON
+  const captureData = {
+    ...capture,
+    timestamp: capture.timestamp.toISOString()
+  };
+  fs.writeFileSync(
+    getContextPath(capture.id),
+    JSON.stringify(captureData, null, 2)
+  );
+
+  // Update metadata index
+  const index = loadMetadataIndex();
+  index.captures.unshift(metadata);  // Add to beginning (most recent first)
+
+  // Keep only last 100 captures in index
+  if (index.captures.length > 100) {
+    index.captures = index.captures.slice(0, 100);
+  }
+
+  saveMetadataIndex(index);
+
+  return metadata;
+}
+
+/**
  * List all captures
  */
 export function listCaptures(): CaptureMetadata[] {
@@ -120,7 +150,7 @@ export function listCaptures(): CaptureMetadata[] {
 }
 
 /**
- * Get a specific capture by ID
+ * Get a specific capture by ID (supports partial ID matching)
  */
 export function getCapture(id: string): BugCapture | null {
   const contextPath = getContextPath(id);
@@ -154,7 +184,7 @@ function getCaptureByPath(contextPath: string): BugCapture | null {
 }
 
 /**
- * Delete a capture by ID (including all frames)
+ * Delete a capture by ID (including all files)
  */
 export function deleteCapture(id: string): boolean {
   const index = loadMetadataIndex();
@@ -174,7 +204,7 @@ export function deleteCapture(id: string): boolean {
 
   // Update index
   index.captures.splice(captureIndex, 1);
-  fs.writeFileSync(METADATA_FILE, JSON.stringify(index, null, 2));
+  saveMetadataIndex(index);
 
   return true;
 }
@@ -189,11 +219,7 @@ export function getStorageStats(): { totalCaptures: number; totalSize: number; o
   for (const capture of captures) {
     const captureDir = getCaptureDir(capture.id);
     if (fs.existsSync(captureDir)) {
-      const files = fs.readdirSync(captureDir);
-      for (const file of files) {
-        const filePath = path.join(captureDir, file);
-        totalSize += fs.statSync(filePath).size;
-      }
+      totalSize += getDirSize(captureDir);
     }
   }
 
@@ -206,6 +232,28 @@ export function getStorageStats(): { totalCaptures: number; totalSize: number; o
     totalSize,
     oldestCapture
   };
+}
+
+/**
+ * Get directory size recursively
+ */
+function getDirSize(dirPath: string): number {
+  let size = 0;
+
+  if (!fs.existsSync(dirPath)) return 0;
+
+  const files = fs.readdirSync(dirPath);
+  for (const file of files) {
+    const filePath = path.join(dirPath, file);
+    const stat = fs.statSync(filePath);
+    if (stat.isDirectory()) {
+      size += getDirSize(filePath);
+    } else {
+      size += stat.size;
+    }
+  }
+
+  return size;
 }
 
 /**
