@@ -1,4 +1,60 @@
-# claude-bug Implementation Architecture
+# claude-bug — Token-Aware Visual Bug Capture
+
+claude-bug is a CLI tool that converts visual bugs into token-optimized, structured multimodal context for Claude Code.
+
+It is designed around a core constraint: raw screen recordings overwhelm LLM context windows, while single screenshots miss temporal causality. claude-bug bridges this gap by extracting high-signal visual moments and pairing them with precise execution context.
+
+## What This Tool Provides
+
+For each capture, claude-bug produces a deterministic, Claude-ready debugging report containing:
+
+- **6–8 key visual frames** selected via perceptual diffing to represent meaningful UI state changes
+- **A chronological visual timeline** showing how the bug emerges and stabilizes
+- **Token-budgeted images** (1024×576 JPEG, ~1.2k tokens each)
+- **Execution context**, including:
+  - Recent terminal errors
+  - Current git branch, commits, and diff
+  - Capture metadata (timestamps, config, token estimates)
+
+The result is a high-signal, low-noise snapshot of a visual failure, optimized for reasoning rather than replay.
+
+## How to Reason About the Report
+
+When analyzing a claude-bug report:
+
+1. **Read the timeline first** — identify the first frame where behavior diverges
+2. **Compare adjacent frames** — focus on what changed, not what persisted
+3. **Cross-reference with git diff** — assume the bug is causally linked to recent changes unless evidence suggests otherwise
+4. **Treat earlier frames as baseline** and later frames as stabilized failure state
+5. **Prefer root-cause hypotheses** over surface-level visual descriptions
+
+If information is insufficient, explicitly state:
+- What additional signal would reduce uncertainty (logs, state, metrics)
+- Which frame(s) would benefit from higher resolution or earlier capture
+
+## Design Principles
+
+- Token economy is a first-class constraint
+- Temporal causality > raw visual fidelity
+- Structured context > verbose narration
+- Determinism over completeness
+
+The report is intentionally minimal: every included frame, log, and diff exists because it increases the probability of identifying a root cause within a fixed context window.
+
+## Expected Output From Claude
+
+Given a claude-bug report, Claude should aim to:
+
+1. Identify the most likely root cause(s)
+2. Explain why the bug manifests visually
+3. Propose a minimal, testable fix
+4. List what additional signals would improve confidence, if any
+
+Avoid speculative UI commentary unless directly tied to a causal hypothesis.
+
+---
+
+# Implementation Architecture
 
 Production-grade CLI tool for capturing visual bugs as token-optimized context for Claude Code.
 
