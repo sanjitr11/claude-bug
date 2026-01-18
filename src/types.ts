@@ -4,6 +4,37 @@ export interface BugCapture {
   timestamp: Date;
   frames: string[];  // Paths to frame images
   duration: number;  // Total capture duration in seconds
+  terminalContext?: TerminalContext;
+  gitContext?: GitContext;
+  environment?: EnvironmentInfo;
+}
+
+export interface TerminalContext {
+  recentCommands: string[];
+  workingDirectory: string;
+  shell: string;
+}
+
+export interface GitContext {
+  isRepo: boolean;
+  branch?: string;
+  modifiedFiles?: string[];
+  recentCommits?: GitCommit[];
+  hasUncommittedChanges?: boolean;
+}
+
+export interface GitCommit {
+  hash: string;
+  message: string;
+  author: string;
+  date: string;
+}
+
+export interface EnvironmentInfo {
+  os: string;
+  nodeVersion?: string;
+  framework?: string;
+  packageManager?: string;
 }
 
 export interface CaptureMetadata {

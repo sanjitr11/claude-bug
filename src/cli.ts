@@ -33,6 +33,7 @@ import {
 } from './storage';
 import { formatForClaude, saveFormattedOutput, formatFileSize, formatDuration } from './formatter';
 import { BugCapture } from './types';
+import { collectAllContext } from './context';
 
 const program = new Command();
 
@@ -159,13 +160,21 @@ program
       }
     }
 
+    // Collect context
+    const contextSpinner = ora('Collecting context...').start();
+    const context = collectAllContext();
+    contextSpinner.succeed('Context collected');
+
     // Create bug capture object
     const capture: BugCapture = {
       id,
       description,
       timestamp: new Date(),
       frames: result.frames,
-      duration: result.duration
+      duration: result.duration,
+      terminalContext: context.terminal,
+      gitContext: context.git,
+      environment: context.environment
     };
 
     // Save capture
