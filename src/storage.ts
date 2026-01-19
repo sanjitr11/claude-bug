@@ -98,7 +98,7 @@ function saveMetadataIndex(index: { captures: CaptureMetadata[] }): void {
 /**
  * Save capture metadata and full capture data
  */
-export function saveCapture(capture: BugCapture, isTemp: boolean = false): CaptureMetadata {
+export function saveCapture(capture: BugCapture, isTemp: boolean = false, model?: string): CaptureMetadata {
   ensureStorageExists();
 
   const captureDir = getCaptureDir(capture.id);
@@ -114,7 +114,8 @@ export function saveCapture(capture: BugCapture, isTemp: boolean = false): Captu
     duration: capture.duration,
     keyFrameCount: capture.keyFrames.length,
     tokenEstimate: capture.metrics.tokenEstimate,
-    isTemp
+    isTemp,
+    model
   };
 
   // Save full capture data as JSON

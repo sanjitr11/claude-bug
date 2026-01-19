@@ -10,7 +10,7 @@ import {
   checkFfmpegInstalled,
   getFfmpegInstallInstructions
 } from './recorder';
-import { runCapture, startCapture, getCaptureReport } from './capture';
+import { runCapture, runCaptureV2, startCapture, getCaptureReport } from './capture';
 import { formatReport, formatFileSize, formatCaptureSummary } from './formatter';
 import { formatTokenEstimate, getTokenBreakdown } from './tokens';
 import {
@@ -27,6 +27,7 @@ import {
   markCaptureViewed,
   parseDuration
 } from './storage';
+import { listModelProfiles, getModelProfile } from './models';
 
 const program = new Command();
 
@@ -96,7 +97,9 @@ program
   .argument('<description>', 'Bug description')
   .option('-i, --interactive', 'Interactive mode - stop recording on keypress')
   .option('-t, --temp', 'Temporary capture - auto-delete after first view')
-  .action(async (description: string, options: { interactive: boolean; temp: boolean }) => {
+  .option('-m, --model <name>', 'Target model profile (claude-code, claude-sonnet, claude-opus, claude-haiku)')
+  .option('-b, --budget <tokens>', 'Override token budget')
+  .action(async (description: string, options: { interactive: boolean; temp: boolean; model?: string; budget?: string }) => {
     const config = loadConfig();
 
     // Check ffmpeg
@@ -108,9 +111,17 @@ program
 
     ensureStorageExists();
 
+    // Determine whether to use v2 pipeline
+    const useV2 = options.model !== undefined;
+    const modelName = options.model || config.defaultModel || 'claude-code';
+    const overrideBudget = options.budget ? parseInt(options.budget, 10) : undefined;
+
     console.log(chalk.cyan('\nclaude-bug capture\n'));
     console.log(chalk.dim(`Description: ${description}`));
     console.log(chalk.dim(`Duration: ${config.duration}s | Target frames: ${config.targetKeyFrames}`));
+    if (useV2) {
+      console.log(chalk.dim(`Model: ${modelName}${overrideBudget ? ` (budget: ${overrideBudget})` : ''}`));
+    }
     if (options.temp) {
       console.log(chalk.yellow('Mode: Temporary (will delete after first view)'));
     }
@@ -119,7 +130,8 @@ program
     const spinner = ora();
 
     try {
-      if (options.interactive) {
+      if (options.interactive && !useV2) {
+        // Note: v2 doesn't support interactive mode yet
         // Interactive mode
         console.log(chalk.cyan('Starting recording...'));
         console.log(chalk.dim('Press any key to stop.\n'));
@@ -157,31 +169,72 @@ program
         // Fixed duration mode
         spinner.start(`Recording ${config.duration}s...`);
 
-        const capture = await runCapture(description, config, (stage, progress, message) => {
-          switch (stage) {
-            case 'recording':
-              spinner.text = `Recording... ${Math.round(progress)}%`;
-              break;
-            case 'extracting':
-              spinner.text = message || 'Extracting frames...';
-              break;
-            case 'selecting':
-              spinner.text = message || 'Selecting key frames...';
-              break;
-            case 'optimizing':
-              spinner.text = message || 'Optimizing images...';
-              break;
-            case 'context':
-              spinner.text = 'Gathering context...';
-              break;
-            case 'formatting':
-              spinner.text = 'Generating report...';
-              break;
-            case 'saving':
-              spinner.text = 'Saving...';
-              break;
-          }
-        });
+        let capture;
+
+        if (useV2) {
+          // Use v2 model-aware pipeline
+          capture = await runCaptureV2(
+            {
+              description,
+              model: modelName,
+              temporary: options.temp,
+              overrideBudget
+            },
+            config,
+            (stage, progress, message) => {
+              switch (stage) {
+                case 'recording':
+                  spinner.text = `Recording... ${Math.round(progress)}%`;
+                  break;
+                case 'extracting':
+                  spinner.text = message || 'Extracting frames...';
+                  break;
+                case 'selecting':
+                  spinner.text = message || 'Selecting key frames...';
+                  break;
+                case 'optimizing':
+                  spinner.text = message || 'Optimizing images...';
+                  break;
+                case 'context':
+                  spinner.text = 'Gathering context...';
+                  break;
+                case 'formatting':
+                  spinner.text = message || 'Generating report...';
+                  break;
+                case 'saving':
+                  spinner.text = 'Saving...';
+                  break;
+              }
+            }
+          );
+        } else {
+          // Use v1 pipeline
+          capture = await runCapture(description, config, (stage, progress, message) => {
+            switch (stage) {
+              case 'recording':
+                spinner.text = `Recording... ${Math.round(progress)}%`;
+                break;
+              case 'extracting':
+                spinner.text = message || 'Extracting frames...';
+                break;
+              case 'selecting':
+                spinner.text = message || 'Selecting key frames...';
+                break;
+              case 'optimizing':
+                spinner.text = message || 'Optimizing images...';
+                break;
+              case 'context':
+                spinner.text = 'Gathering context...';
+                break;
+              case 'formatting':
+                spinner.text = 'Generating report...';
+                break;
+              case 'saving':
+                spinner.text = 'Saving...';
+                break;
+            }
+          });
+        }
 
         spinner.succeed('Capture complete');
 
@@ -501,6 +554,45 @@ program
         console.error(chalk.red(`Unknown config key: ${key}`));
         console.log(chalk.dim('Valid keys: duration, targetFrames, diffThreshold, maxTokens, ttl'));
         process.exit(1);
+    }
+  });
+
+// Models command
+program
+  .command('models')
+  .description('List or show model profiles')
+  .argument('[name]', 'Profile name to show details')
+  .action((name?: string) => {
+    if (name) {
+      // Show specific profile details
+      const profile = getModelProfile(name);
+      console.log(chalk.cyan(`\nModel Profile: ${profile.name}\n`));
+      console.log(chalk.bold('Context Budget:'), `${profile.maxTokens.toLocaleString()} tokens`);
+      console.log(chalk.bold('Image Token Estimate:'), `~${profile.imageTokenEstimate} tokens per image`);
+      console.log(chalk.bold('Preferred Frames:'), profile.preferredFrames);
+      console.log(chalk.bold('Max Frames:'), profile.maxFrames);
+      console.log(chalk.bold('\nContext Bias:'));
+      console.log(`  Visual: ${(profile.contextBias.visual * 100).toFixed(0)}%`);
+      console.log(`  Code: ${(profile.contextBias.code * 100).toFixed(0)}%`);
+      console.log(`  Execution: ${(profile.contextBias.execution * 100).toFixed(0)}%`);
+      console.log(chalk.bold('\nPrompt Style:'));
+      console.log(`  Verbosity: ${profile.promptStyle.verbosity}`);
+      console.log(`  Timeline Refs: ${profile.promptStyle.includeTimelineRefs ? 'yes' : 'no'}`);
+      console.log(`  Diff Correlation: ${profile.promptStyle.includeDiffCorrelation ? 'yes' : 'no'}`);
+      console.log(`  Uncertainty Guidance: ${profile.promptStyle.includeUncertaintyGuidance ? 'yes' : 'no'}`);
+      console.log(`  Causal Focus: ${profile.promptStyle.causalFocusLevel}`);
+      console.log('');
+    } else {
+      // List all profiles
+      const profiles = listModelProfiles();
+      console.log(chalk.cyan('\nAvailable Model Profiles\n'));
+      for (const profileName of profiles) {
+        const profile = getModelProfile(profileName);
+        console.log(chalk.bold(profile.name));
+        console.log(chalk.dim(`  ${profile.maxTokens.toLocaleString()} token budget | ${profile.preferredFrames} preferred frames`));
+      }
+      console.log(chalk.dim('\nUse with: claude-bug capture "description" --model <profile>\n'));
+      console.log(chalk.dim('View details: claude-bug models <profile>\n'));
     }
   });
 
