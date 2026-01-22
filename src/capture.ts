@@ -4,7 +4,7 @@ import { recordScreen, startInteractiveRecording, getVideoDuration } from './rec
 import { extractFrames } from './frames';
 import { selectKeyFrames } from './selection';
 import { optimizeKeyFrames } from './optimize';
-import { gatherContext } from './context';
+import { gatherContext, trimTerminalContext, trimGitContext } from './context';
 import { formatReport, saveFormattedOutput, formatReportV2 } from './formatter';
 import { estimateTotalTokens } from './tokens';
 import {
@@ -368,6 +368,14 @@ export async function runCaptureV2(
     onProgress?.('selecting', 57, `Budget adjustments: ${allocation.adjustments.join('; ')}`);
   }
 
+  // Stage 4b: Trim context to fit budget allocation
+  const trimmedTerminal = trimTerminalContext(context.terminal, allocation.terminalLines);
+  const trimmedGit = trimGitContext(context.git, allocation.gitDiffLines, allocation.includeFullDiff);
+
+  // Update context with trimmed versions
+  context.terminal = trimmedTerminal;
+  context.git = trimmedGit;
+
   // Stage 5: Model-aligned frame selection (60-70%)
   onProgress?.('selecting', 60, `Selecting ${allocation.frameCount} key frames...`);
 
@@ -425,28 +433,51 @@ export async function runCaptureV2(
   const utilization = calculateTokenUtilization(profile, optimizedFrames, context, promptTokens);
 
   // Stage 9: Validate budget (drop frames if needed) (92-94%)
-  const validation = validateBudget(utilization);
+  let validation = validateBudget(utilization);
+  let finalUtilization = utilization;
+  let currentFrames = optimizedFrames;
+
   if (!validation.valid) {
     onProgress?.('formatting', 92, `Over budget, applying adjustments...`);
-    const newFrameCount = optimizedFrames.length - 1;
-    const trimmedFrames = dropFramesForBudget(optimizedFrames, newFrameCount);
+
+    // Calculate how many frames to drop based on actual overage
+    const overage = utilization.total - (utilization.budget * 0.95);
+    const tokensPerFrame = utilization.visual / currentFrames.length;
+    const framesToDrop = Math.ceil(overage / tokensPerFrame);
+
+    // Ensure we keep at least 2 frames (start and end anchors)
+    const minFrames = 2;
+    const targetFrameCount = Math.max(minFrames, currentFrames.length - framesToDrop);
+
+    // Use entropy-based dropping (dropPriority)
+    const trimmedFrames = dropFramesForBudget(currentFrames, targetFrameCount);
+    currentFrames = trimmedFrames;
     capture.keyFrames = trimmedFrames;
     capture.metrics.keyFrames = trimmedFrames.length;
 
-    // Recalculate utilization
-    const newUtilization = calculateTokenUtilization(profile, trimmedFrames, context, promptTokens);
+    // Recalculate utilization after dropping frames
+    finalUtilization = calculateTokenUtilization(profile, trimmedFrames, context, promptTokens);
 
-    // Generate report with new utilization
-    const report = formatReportV2(capture, profile, newUtilization, suggestedPrompt);
-    fs.writeFileSync(reportPath, report);
-  } else {
-    // Generate report
-    const report = formatReportV2(capture, profile, utilization, suggestedPrompt);
-    fs.writeFileSync(reportPath, report);
+    // If still over budget, continue dropping until we're under
+    let attempts = 0;
+    while (!validateBudget(finalUtilization).valid && currentFrames.length > minFrames && attempts < 5) {
+      attempts++;
+      const newTargetCount = currentFrames.length - 1;
+      currentFrames = dropFramesForBudget(currentFrames, newTargetCount);
+      capture.keyFrames = currentFrames;
+      capture.metrics.keyFrames = currentFrames.length;
+      finalUtilization = calculateTokenUtilization(profile, currentFrames, context, promptTokens);
+    }
+
+    onProgress?.('formatting', 93, `Dropped ${optimizedFrames.length - currentFrames.length} frames to fit budget`);
   }
 
-  // Update token estimate
-  capture.metrics.tokenEstimate = utilization.total;
+  // Generate report with final utilization
+  const report = formatReportV2(capture, profile, finalUtilization, suggestedPrompt);
+  fs.writeFileSync(reportPath, report);
+
+  // Update token estimate with final utilization
+  capture.metrics.tokenEstimate = finalUtilization.total;
 
   onProgress?.('formatting', 95, 'Report generated');
 
@@ -458,6 +489,189 @@ export async function runCaptureV2(
   onProgress?.('saving', 100, 'Capture complete');
 
   return capture;
+}
+
+/**
+ * Run interactive capture with model awareness (v2)
+ * Records until stopped, then processes with model-aware pipeline
+ */
+export function startCaptureV2(
+  options: ModelAwareCaptureOptions,
+  config: Config,
+  onProgress?: ProgressCallback
+): {
+  stop: () => Promise<BugCapture>;
+  recordingHandle: InteractiveRecordingHandle;
+} {
+  const startTime = Date.now();
+  const id = uuidv4();
+
+  // 1. Load model profile
+  const profile = getModelProfile(options.model);
+  if (options.overrideBudget) {
+    profile.maxTokens = options.overrideBudget;
+  }
+
+  // Ensure storage exists
+  ensureStorageExists();
+
+  // Set up paths
+  const captureDir = getCaptureDir(id);
+  const videoPath = getVideoPath(id);
+  const framesDir = getFramesDir(id);
+  const keyFramesDir = getKeyFramesDir(id);
+  const reportPath = getFormattedPath(id);
+
+  // Start recording
+  onProgress?.('recording', 0, `Starting video recording (target: ${profile.name})...`);
+
+  const recordingHandle = startInteractiveRecording({
+    resolution: { width: 1280, height: 720 },
+    fps: 30,
+    outputPath: videoPath
+  });
+
+  const stop = async (): Promise<BugCapture> => {
+    // Stop recording
+    const recordingResult = await recordingHandle.stop();
+
+    if (!recordingResult.success) {
+      throw new Error(`Recording failed: ${recordingResult.error}`);
+    }
+
+    onProgress?.('recording', 40, 'Recording complete');
+
+    // Stage 2: Extract frames (40-50%)
+    onProgress?.('extracting', 40, 'Extracting frames from video...');
+
+    const frames = await extractFrames(videoPath, framesDir, 2);
+
+    if (frames.length === 0) {
+      throw new Error('No frames extracted from video');
+    }
+
+    onProgress?.('extracting', 50, `Extracted ${frames.length} frames`);
+
+    // Stage 3: Gather context (50-55%)
+    onProgress?.('context', 50, 'Gathering context...');
+
+    const context = gatherContext();
+
+    onProgress?.('context', 55, 'Context gathered');
+
+    // Stage 4: Calculate budget allocation (55-60%)
+    onProgress?.('selecting', 55, 'Calculating budget allocation...');
+
+    const allocation = calculateBudgetAllocation(profile, frames.length, context);
+
+    // Stage 4b: Trim context to fit budget allocation
+    context.terminal = trimTerminalContext(context.terminal, allocation.terminalLines);
+    context.git = trimGitContext(context.git, allocation.gitDiffLines, allocation.includeFullDiff);
+
+    // Stage 5: Model-aligned frame selection (60-70%)
+    onProgress?.('selecting', 60, `Selecting ${allocation.frameCount} key frames...`);
+
+    let keyFrames = await selectModelAlignedFrames(
+      frames,
+      profile,
+      allocation.frameCount
+    );
+
+    onProgress?.('selecting', 70, `Selected ${keyFrames.length} key frames`);
+
+    // Stage 6: Optimize frames with budget-aware quality (70-85%)
+    onProgress?.('optimizing', 70, 'Optimizing images...');
+
+    const optimizedFrames = await optimizeKeyFramesV2(
+      keyFrames,
+      keyFramesDir,
+      allocation.frameResolution.width,
+      allocation.frameQuality
+    );
+
+    onProgress?.('optimizing', 85, 'Images optimized');
+
+    // Stage 7: Generate model-aligned prompt (85-90%)
+    onProgress?.('formatting', 85, 'Generating model-aligned prompt...');
+
+    const processingTime = Date.now() - startTime;
+
+    const capture: BugCapture = {
+      id,
+      description: options.description,
+      timestamp: new Date(),
+      duration: recordingResult.duration,
+      videoPath,
+      framesDir,
+      keyFramesDir,
+      reportPath,
+      metrics: {
+        totalFrames: frames.length,
+        keyFrames: optimizedFrames.length,
+        tokenEstimate: 0,
+        processingTime
+      },
+      context,
+      keyFrames: optimizedFrames
+    };
+
+    const suggestedPrompt = generateModelAlignedPrompt(capture, profile);
+    const promptTokens = estimatePromptTokens(suggestedPrompt);
+
+    // Stage 8: Calculate token utilization (90-92%)
+    onProgress?.('formatting', 90, 'Calculating token utilization...');
+
+    let utilization = calculateTokenUtilization(profile, optimizedFrames, context, promptTokens);
+    let finalUtilization = utilization;
+    let currentFrames = optimizedFrames;
+
+    // Stage 9: Validate budget (drop frames if needed) (92-94%)
+    let validation = validateBudget(utilization);
+
+    if (!validation.valid) {
+      onProgress?.('formatting', 92, `Over budget, applying adjustments...`);
+
+      const overage = utilization.total - (utilization.budget * 0.95);
+      const tokensPerFrame = utilization.visual / currentFrames.length;
+      const framesToDrop = Math.ceil(overage / tokensPerFrame);
+      const minFrames = 2;
+      const targetFrameCount = Math.max(minFrames, currentFrames.length - framesToDrop);
+
+      currentFrames = dropFramesForBudget(currentFrames, targetFrameCount);
+      capture.keyFrames = currentFrames;
+      capture.metrics.keyFrames = currentFrames.length;
+      finalUtilization = calculateTokenUtilization(profile, currentFrames, context, promptTokens);
+
+      let attempts = 0;
+      while (!validateBudget(finalUtilization).valid && currentFrames.length > minFrames && attempts < 5) {
+        attempts++;
+        currentFrames = dropFramesForBudget(currentFrames, currentFrames.length - 1);
+        capture.keyFrames = currentFrames;
+        capture.metrics.keyFrames = currentFrames.length;
+        finalUtilization = calculateTokenUtilization(profile, currentFrames, context, promptTokens);
+      }
+    }
+
+    // Generate report with final utilization
+    const report = formatReportV2(capture, profile, finalUtilization, suggestedPrompt);
+    fs.writeFileSync(reportPath, report);
+
+    // Update token estimate with final utilization
+    capture.metrics.tokenEstimate = finalUtilization.total;
+
+    onProgress?.('formatting', 95, 'Report generated');
+
+    // Stage 10: Save capture (95-100%)
+    onProgress?.('saving', 95, 'Saving capture...');
+
+    saveCapture(capture, options.temporary || false, options.model);
+
+    onProgress?.('saving', 100, 'Capture complete');
+
+    return capture;
+  };
+
+  return { stop, recordingHandle };
 }
 
 /**

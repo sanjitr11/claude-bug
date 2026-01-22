@@ -216,3 +216,85 @@ export function gatherContext(): CaptureContext {
     git: gatherGitContext()
   };
 }
+
+/**
+ * Trim terminal context to fit within budget allocation
+ * Prioritizes error lines over recent output
+ */
+export function trimTerminalContext(context: TerminalContext, maxLines: number): TerminalContext {
+  // If already within limits, return as-is
+  if (context.errors.length <= maxLines && context.recentOutput.length <= maxLines) {
+    return context;
+  }
+
+  // Prioritize errors - they're more valuable for debugging
+  const trimmedErrors = context.errors.slice(0, maxLines);
+
+  // For recent output, keep roughly 1.5x the error limit but cap at original size
+  const outputLimit = Math.min(Math.ceil(maxLines * 1.5), context.recentOutput.length);
+  const trimmedOutput = context.recentOutput.slice(-outputLimit);
+
+  // Recalculate token estimate
+  const textForTokens = trimmedErrors.length > 0
+    ? trimmedErrors.join('\n')
+    : trimmedOutput.slice(-20).join('\n');
+  const tokenEstimate = Math.min(estimateTextTokens(textForTokens), 400);
+
+  return {
+    recentOutput: trimmedOutput,
+    errors: trimmedErrors,
+    tokenEstimate
+  };
+}
+
+/**
+ * Trim git context to fit within budget allocation
+ * Controls diff size and whether to include full diff
+ */
+export function trimGitContext(
+  context: GitContext,
+  maxDiffLines: number,
+  includeFullDiff: boolean
+): GitContext {
+  // If no diff or already within limits, minimal changes needed
+  if (!context.diff) {
+    return context;
+  }
+
+  const diffLines = context.diff.split('\n');
+
+  // If diff is within limits and we want full diff, return as-is
+  if (diffLines.length <= maxDiffLines && includeFullDiff) {
+    return context;
+  }
+
+  let trimmedDiff: string | null;
+
+  if (!includeFullDiff) {
+    // Use stat summary only
+    try {
+      const statOutput = execSync('git diff --stat', { encoding: 'utf-8' }).trim();
+      trimmedDiff = `${statOutput}\n\n(Full diff omitted - ${diffLines.length} lines)`;
+    } catch {
+      trimmedDiff = `(Diff summary unavailable - ${diffLines.length} lines total)`;
+    }
+  } else if (diffLines.length > maxDiffLines) {
+    // Truncate to max lines with indicator
+    const truncated = diffLines.slice(0, maxDiffLines);
+    trimmedDiff = truncated.join('\n') + `\n\n... (truncated, ${diffLines.length - maxDiffLines} more lines)`;
+  } else {
+    trimmedDiff = context.diff;
+  }
+
+  // Recalculate token estimate
+  let text = `Branch: ${context.branch}\n`;
+  text += context.recentCommits.join('\n') + '\n';
+  if (trimmedDiff) text += trimmedDiff;
+  const tokenEstimate = Math.min(estimateTextTokens(text), 200);
+
+  return {
+    ...context,
+    diff: trimmedDiff,
+    tokenEstimate
+  };
+}

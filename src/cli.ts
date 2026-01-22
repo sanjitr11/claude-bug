@@ -10,7 +10,7 @@ import {
   checkFfmpegInstalled,
   getFfmpegInstallInstructions
 } from './recorder';
-import { runCapture, runCaptureV2, startCapture, getCaptureReport } from './capture';
+import { runCapture, runCaptureV2, startCapture, startCaptureV2, getCaptureReport } from './capture';
 import { formatReport, formatFileSize, formatCaptureSummary } from './formatter';
 import { formatTokenEstimate, getTokenBreakdown } from './tokens';
 import {
@@ -130,21 +130,45 @@ program
     const spinner = ora();
 
     try {
-      if (options.interactive && !useV2) {
-        // Note: v2 doesn't support interactive mode yet
-        // Interactive mode
+      if (options.interactive) {
+        // Interactive mode (both V1 and V2 supported)
         console.log(chalk.cyan('Starting recording...'));
         console.log(chalk.dim('Press any key to stop.\n'));
 
-        const handle = startCapture(description, config, (stage, progress, message) => {
-          if (stage === 'recording') {
-            spinner.text = 'Recording... (press any key to stop)';
-          } else {
-            spinner.text = message || stage;
-          }
-        });
+        let handle;
+        if (useV2) {
+          // V2 interactive mode with model awareness
+          handle = startCaptureV2(
+            {
+              description,
+              model: modelName,
+              temporary: options.temp,
+              overrideBudget
+            },
+            config,
+            (stage, progress, message) => {
+              if (stage === 'recording') {
+                spinner.text = `Recording... (press any key to stop) [${modelName}]`;
+              } else {
+                spinner.text = message || stage;
+              }
+            }
+          );
+        } else {
+          // V1 interactive mode
+          handle = startCapture(description, config, (stage, progress, message) => {
+            if (stage === 'recording') {
+              spinner.text = 'Recording... (press any key to stop)';
+            } else {
+              spinner.text = message || stage;
+            }
+          });
+        }
 
-        spinner.start('Recording... (press any key to stop)');
+        spinner.start(useV2
+          ? `Recording... (press any key to stop) [${modelName}]`
+          : 'Recording... (press any key to stop)'
+        );
 
         await waitForKeypress();
 
